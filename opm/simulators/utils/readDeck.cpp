@@ -193,6 +193,165 @@ namespace {
         wtestState = std::make_unique<Opm::WellTestState>();
     }
 
+    double linear_interpolation(double x, double x1, double y1, double x2, double y2)
+    {
+        return y1 + (x - x1) * (y2 - y1) / (x2 - x1);
+    }
+
+    void linear_interpolation(const std::vector<double> &x, std::vector<double> &y, const std::vector<int> &index)
+    {
+        if (index[0] == 0 && index.size() == x.size()) {
+            for (int i = 0; i < x.size(); i++) {
+                y[i] = 0;
+            }
+            return;
+        }
+
+        if (index[0] == 1 && index.size() == x.size() - 1) {
+            for (int j = 1; j < y.size(); j++) {
+                    y[j] = y[0];
+            }
+            return;
+        }
+
+        for (int i = 0; i < index.size(); i++) {
+            int next_real_value_index = index[i] + 1;
+
+            for (;next_real_value_index < x.size() && i + 1 < index.size(); next_real_value_index++) {
+                for (int j = i + 1; j < index.size(); j++) {
+                    if (next_real_value_index != index[j]) break;
+                }
+            }
+
+            if (next_real_value_index == -1) {
+                for (int j = i + 1; j < y.size(); j++) {
+                    y[j] = y[index[i] - 1];
+                }
+                break;
+            }
+            y[index[i]] = linear_interpolation(x[index[i]], x[index[i] - 1], y[index[i] - 1], x[next_real_value_index], y[next_real_value_index]);
+        }
+    }
+
+    Opm::Deck convert(Opm::Deck deck)
+    {
+        if (!deck.hasKeyword("PVCO")) return std::move(deck);
+        // Their index in PVCO [0..n)
+        #define Pbub    0
+        #define Rs      1
+        #define Bo      2
+        #define Mo      3
+        #define Co       4
+        #define Cv      5
+        #define AT(x, y) ((x) * 6 + (y))
+
+        std::vector<Opm::Dimension> RS_active_dimensions;
+        std::vector<Opm::Dimension> RS_default_dimensions;
+        std::vector<Opm::Dimension> DATA_active_dimensions;
+        std::vector<Opm::Dimension> DATA_default_dimensions;
+        {
+            std::vector< std::string > m_dimensions;
+            auto active_unitsystem = deck.getActiveUnitSystem();
+            auto default_unitsystem = deck.getDefaultUnitSystem();
+            m_dimensions.push_back("GasDissolutionFactor");
+            for (const auto& dim_string : m_dimensions) {
+                RS_active_dimensions.push_back( active_unitsystem.getNewDimension(dim_string) );
+                RS_default_dimensions.push_back( default_unitsystem.getNewDimension(dim_string) );
+            }
+            m_dimensions.clear();
+            m_dimensions.push_back("Pressure");
+            m_dimensions.push_back("1");
+            m_dimensions.push_back("Viscosity");
+            for (const auto& dim_string : m_dimensions) {
+                DATA_active_dimensions.push_back( active_unitsystem.getNewDimension(dim_string) );
+                DATA_default_dimensions.push_back( default_unitsystem.getNewDimension(dim_string) );
+            }
+        }
+
+        std::vector< const Opm::DeckKeyword* > kwlist = deck.getKeywordList("PVCO");
+        auto kw = kwlist.at(0);
+        Opm::DeckKeyword keyword( kw->location(), "PVTO" );
+        keyword.setDataKeyword(false);
+
+        // handle when table is more than one
+        for (int ntab = 0; ntab < kw->size();) {
+            auto dataRecord = kw->getRecord(ntab);
+            auto dataItem = dataRecord.getDataItem();
+            auto raw_data = dataItem.getData<double>();
+            
+            int ncols = 6;
+            int nrows = raw_data.size() / ncols;
+
+            std::vector<std::vector<double>> data(6);
+            std::unordered_map<int, std::vector<int>> default_data;
+            for (int nr = 0; nr < nrows; nr++) {
+                for (int i = 0; i < 6; i++) {
+                    data[i].push_back(raw_data[AT(nr, i)]);
+                    if (dataItem.defaultApplied(AT(nr, i))) default_data[i].push_back(nr);
+                }
+            }
+
+            for (auto [col, index] : default_data) {
+                if (index.size() == 0) continue;
+                // Pbub default data is none so we can use it
+                linear_interpolation(data[Pbub], data[col], index);
+            }
+
+            double PMAX = deck.getKeywordList("PMAX").at(0)->getDataRecord().getItem(0).getData<double>()[0];
+            int nppvt = deck.getKeywordList("TABDIMS").at(0)->getDataRecord().getItem(3).getData<int>()[0];
+            
+            for (int i = 0; i < nrows; i++) {
+                std::vector< Opm::DeckItem > items;
+                {
+                    Opm::DeckItem item("RS", double(), RS_active_dimensions, RS_default_dimensions);
+                    item.push_back(data[Rs][i]);
+                    items.emplace_back(item);
+                }
+                {
+                    Opm::DeckItem item("DATA", double(), DATA_active_dimensions, DATA_default_dimensions);
+                    double pb_ref = data[Pbub][i];
+                    double bo_ref = data[Bo][i];
+                    double mo_ref = data[Mo][i];
+                    double co = data[Co][i];
+                    double cv = data[Cv][i];
+                    double diff_pb = (PMAX - pb_ref) / nppvt;
+                    item.push_back(pb_ref);
+                    item.push_back(bo_ref);
+                    item.push_back(mo_ref);
+                    for (int n = 1; n < nppvt; n++) {
+                        double pb = pb_ref + diff_pb * n;
+                        double bo = bo_ref * std::exp(-co * (pb - pb_ref));
+                        double mo = (bo_ref * mo_ref * std::exp(-(co - cv) * (pb - pb_ref))) / bo;
+                        
+                        item.push_back(pb);
+                        item.push_back(bo);
+                        item.push_back(mo);
+                    }
+                    items.emplace_back(item);
+                }
+                keyword.addRecord(Opm::DeckRecord{ std::move( items ), false });
+            }
+            if (++ntab == kw->size()) break;
+
+            // We need a split flag
+            std::vector< Opm::DeckItem > items;
+            Opm::DeckItem item("RS", double(), RS_active_dimensions, RS_default_dimensions);
+            item.push_backDefault(0.0, 0);
+            items.emplace_back(item);
+            items.emplace_back(Opm::DeckItem("DATA", double(), DATA_active_dimensions, DATA_default_dimensions));
+            keyword.addRecord(Opm::DeckRecord{ std::move( items ), false });
+        }
+
+        for (auto it = deck.begin(); it != deck.end(); ++it) {
+            if (it->name() == "PVCO") {
+                *it = keyword;
+                break;
+            }
+        }
+
+        return std::move(deck);
+    }
+
     Opm::Deck
     readDeckFile(const std::string&       deckFilename,
                  const bool               checkDeck,
@@ -201,7 +360,8 @@ namespace {
                  const bool               treatCriticalAsNonCritical,
                  Opm::ErrorGuard&         errorGuard)
     {
-        Opm::Deck deck(parser.parseFile(deckFilename, parseContext, errorGuard));
+        // Opm::Deck deck(parser.parseFile(deckFilename, parseContext, errorGuard));
+        Opm::Deck deck(convert(parser.parseFile(deckFilename, parseContext, errorGuard)));
 
         auto keyword_validator = Opm::KeywordValidation::KeywordValidator {
             Opm::FlowKeywordValidation::unsupportedKeywords(),

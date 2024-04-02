@@ -450,7 +450,6 @@ const KeywordValidation::UnsupportedKeywords& unsupportedKeywords()
         {"PLYVISCT", {true, std::nullopt}},
         {"PLYVSCST", {true, std::nullopt}},
         {"PVZG", {true, std::nullopt}},
-        {"PMAX", {true, std::nullopt}},
         {"PRIORITY", {true, std::nullopt}},
         {"PSTEADY", {true, std::nullopt}},
         {"PSWRG", {true, std::nullopt}},
