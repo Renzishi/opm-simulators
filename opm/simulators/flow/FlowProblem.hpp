@@ -541,6 +541,22 @@ public:
             this->model().linearizer().updateDiscretizationParameters();
         }
 
+        if (episodeIdx >= 0 && events.hasEvent(ScheduleEvents::SATNUM_CHANGE)) {
+            std::vector<DeckKeyword> satnum_kw_list;
+            for (auto kw : schedule.get_sched_deck()[episodeIdx]) {
+                if (kw.name() == "SATNUM") {
+                    satnum_kw_list.emplace_back(kw);
+                }
+            }
+            eclState.apply_schedule_keywords( satnum_kw_list );
+            this->updateSatnum_();
+            materialLawManager_ = std::make_shared<EclMaterialLawManager>();
+            materialLawManager_->initFromState(eclState);
+            materialLawManager_->initParamsForElements(eclState, this->model().numGridDof(),
+                                                       this-> template fieldPropIntTypeOnLeafAssigner_<int>(),
+                                                       this-> lookupIdxOnLevelZeroAssigner_());
+        }
+
         bool tuningEvent = this->beginEpisode_(enableExperiments, this->episodeIndex());
 
         // set up the wells for the next episode.
