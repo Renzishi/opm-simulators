@@ -155,7 +155,6 @@ const KeywordValidation::UnsupportedKeywords& unsupportedKeywords()
         {"DZMATRIX", {true, std::nullopt}},
         {"DZMTRX", {true, std::nullopt}},
         {"DZMTRXV", {true, std::nullopt}},
-        {"DZNET", {true, std::nullopt}},
         {"ECHO", {false, std::nullopt}},
         {"ECLMC", {true, std::nullopt}},
         {"EHYSTRR", {true, std::nullopt}},
