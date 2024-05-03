@@ -930,6 +930,9 @@ public:
     const typename Vanguard::TransmissibilityType& eclTransmissibilities() const
     { return transmissibilities_; }
 
+    typename Vanguard::TransmissibilityType& eclTransmissibilities()
+    { return transmissibilities_; }
+
     /*!
      * \copydoc BlackOilBaseProblem::thresholdPressure
      */
