@@ -346,84 +346,6 @@ std::set<std::string> consistentlyFailingWells(const std::vector<StepReport>& sr
                                  "The minimum time step size (in days for field and metric unit and hours for lab unit) can be reduced to based on newton iteration counts");
         }
 
-        template <class Solver>
-        void timeVariation(Solver& solver) {
-            const auto& simulator_ = solver.model().simulator();
-            const auto& gridView_ = simulator_.gridView();
-            // 面积相关
-            // ElementMapper elemMapper(gridView_, Dune::mcmgElementLayout());
-            // unsigned numElements = elemMapper.size();
-            for (const auto& elem : elements(gridView_)) {
-                // unsigned elemIdx = elemMapper.index(elem);
-
-                auto isIt = gridView_.ibegin(elem);
-                const auto& isEndIt = gridView_.iend(elem);
-                unsigned boundaryIsIdx = 0;
-                for (; isIt != isEndIt; ++ isIt) {
-
-                    const auto& intersection = *isIt;
-                    const auto& geometry = intersection.geometry();
-                    const auto& faceCenterInside = geometry.center();
-
-                    auto faceAreaNormal = intersection.centerUnitOuterNormal();
-                    faceAreaNormal *= geometry.volume();
-                }
-            }
-
-            // 流量相关
-            using FluidSystem = GetPropType<TypeTag, Properties::FluidSystem>;
-            using Indices = GetPropType<TypeTag, Properties::Indices>;
-            using ElementContext = GetPropType<TypeTag, Properties::ElementContext>;
-            enum { conti0EqIdx = Indices::conti0EqIdx };
-            enum { numPhases = FluidSystem::numPhases };
-            enum { oilPhaseIdx = FluidSystem::oilPhaseIdx };
-            enum { gasPhaseIdx = FluidSystem::gasPhaseIdx };
-            enum { waterPhaseIdx = FluidSystem::waterPhaseIdx };
-            enum { gasCompIdx = FluidSystem::gasCompIdx };
-            enum { oilCompIdx = FluidSystem::oilCompIdx };
-            enum { waterCompIdx = FluidSystem::waterCompIdx };
-            ElementContext elemCtx(simulator_);
-            const auto& problem = simulator_.problem();
-            if (!simulator_.model().linearizer().getFlowsInfo().empty()) {
-                for (const auto& elem : elements(gridView_, Dune::Partitions::interior)) {
-                    elemCtx.updatePrimaryStencil(elem);
-                    elemCtx.updatePrimaryIntensiveQuantities(/*timeIdx=*/0);
-
-                    for (unsigned dofIdx = 0; dofIdx < elemCtx.numPrimaryDof(/*timeIdx=*/0); ++dofIdx) {
-
-                        unsigned globalDofIdx = elemCtx.globalSpaceIndex(dofIdx, /*timeIdx=*/0);
-                        if (!problem.model().linearizer().getFlowsInfo().empty()) {
-                            const auto& flowsInf = problem.model().linearizer().getFlowsInfo();
-                            auto flowsInfos = flowsInf[globalDofIdx];
-                            for (auto& flowsInfo : flowsInfos) {
-                                if (flowsInfo.faceId >= 0) {
-                                    // if (!this->flows_[flowsInfo.faceId][gasCompIdx].empty()) {
-                                    //     this->flows_[flowsInfo.faceId][gasCompIdx][globalDofIdx]
-                                    //         = flowsInfo.flow[conti0EqIdx + Indices::canonicalToActiveComponentIndex(gasCompIdx)];
-                                    // }
-                                    // if (!this->flows_[flowsInfo.faceId][oilCompIdx].empty()) {
-                                    //     this->flows_[flowsInfo.faceId][oilCompIdx][globalDofIdx]
-                                    //         = flowsInfo.flow[conti0EqIdx + Indices::canonicalToActiveComponentIndex(oilCompIdx)];
-                                    // }
-                                    // if (!this->flows_[flowsInfo.faceId][waterCompIdx].empty()) {
-                                    //     this->flows_[flowsInfo.faceId][waterCompIdx][globalDofIdx]
-                                    //         = flowsInfo.flow[conti0EqIdx + Indices::canonicalToActiveComponentIndex(waterCompIdx)];
-                                    // }
-                                    auto gas = flowsInfo.flow[conti0EqIdx + Indices::canonicalToActiveComponentIndex(gasCompIdx)];
-                                    auto oil = flowsInfo.flow[conti0EqIdx + Indices::canonicalToActiveComponentIndex(oilCompIdx)];
-                                    auto water = flowsInfo.flow[conti0EqIdx + Indices::canonicalToActiveComponentIndex(waterCompIdx)];
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            
-            // 孔隙度相关
-            const auto& poro_data = simulator_.vanguard().eclState().fieldProps().get_double("PORO");
-        }
-
         /** \brief  step method that acts like the solver::step method
                     in a sub cycle of time steps
             \param tuningUpdater Function used to update TUNING parameters before each
@@ -609,7 +531,9 @@ std::set<std::string> consistentlyFailingWells(const std::vector<StepReport>& sr
                     report.success.converged = substepTimer.done();
                     substepTimer.setLastStepFailed(false);
 
-                    solver.model().timeVariation(dt);
+                    if (simulator.vanguard().eclState().getTableManager().useTransmis()) {
+                        solver.model().timeVariation(dt);
+                    }
                 }
                 else { // in case of no convergence
                     substepTimer.setLastStepFailed(true);

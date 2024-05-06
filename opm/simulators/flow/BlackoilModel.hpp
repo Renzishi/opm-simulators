@@ -1314,6 +1314,7 @@ namespace Opm {
         using GridView = GetPropType<TypeTag, Properties::GridView>;
         using DimVector = Dune::FieldVector<Scalar, GridView::dimensionworld>;
         using ScalarBuffer = std::vector<Scalar>;
+        using DoubleBuf = std::vector<double>;
         using Dir = FaceDir::DirEnum;
 
         static constexpr int numPhases_ = FluidSystem::numPhases;
@@ -1324,278 +1325,129 @@ namespace Opm {
         static constexpr int oilCompIdx = FluidSystem::oilCompIdx;
         static constexpr int waterCompIdx = FluidSystem::waterCompIdx;
         static constexpr int conti0EqIdx = Indices::conti0EqIdx;
+        static constexpr int dirX = 0;
+        static constexpr int dirY = 1;
+        static constexpr int dirZ = 2;
 
-        std::array<std::array<ScalarBuffer, numPhases_>, 6> flows_;
-        std::array<ScalarBuffer, numPhases_> centerFaceFluxes_;
+        const std::array<int, 3> phaseIdxs_ = { oilPhaseIdx, waterPhaseIdx, gasPhaseIdx };
+        const std::array<int, 3> compIdxs_ = { oilCompIdx, waterCompIdx, gasCompIdx };
+        std::array<std::array<ScalarBuffer, numPhases_>, 3> flows_;
         LookUpCartesianData<Grid,GridView> lookUpCartesianData_;
+        std::array<std::array<ScalarBuffer, numPhases_>, 3> flux_;
+        std::array<DoubleBuf, 3> initialPerm_;
+        DoubleBuf initialPorv_;
 
         void doAllocBuffers(unsigned bufferSize) {
-            const std::array<int, 3> phaseIdxs = { gasPhaseIdx, oilPhaseIdx, waterPhaseIdx };
-            const std::array<int, 3> compIdxs = { gasCompIdx, oilCompIdx, waterCompIdx };
-
-            for (unsigned ii = 0; ii < phaseIdxs.size(); ++ii) {
-                if (FluidSystem::phaseIsActive(phaseIdxs[ii])) {
-                    flows_[FaceDir::ToIntersectionIndex(Dir::XPlus)][compIdxs[ii]].resize(bufferSize, 0.0);
-                    flows_[FaceDir::ToIntersectionIndex(Dir::YPlus)][compIdxs[ii]].resize(bufferSize, 0.0);
-                    flows_[FaceDir::ToIntersectionIndex(Dir::ZPlus)][compIdxs[ii]].resize(bufferSize, 0.0);
-                    centerFaceFluxes_[compIdxs[ii]].resize(bufferSize, 0.0);
+            for (unsigned ii = 0; ii < phaseIdxs_.size(); ++ii) {
+                if (FluidSystem::phaseIsActive(phaseIdxs_[ii])) {
+                    flows_[dirX][compIdxs_[ii]].resize(bufferSize, 0.0);
+                    flows_[dirY][compIdxs_[ii]].resize(bufferSize, 0.0);
+                    flows_[dirZ][compIdxs_[ii]].resize(bufferSize, 0.0);
+                    flux_[dirX][compIdxs_[ii]].resize(bufferSize, 0.0);
+                    flux_[dirY][compIdxs_[ii]].resize(bufferSize, 0.0);
+                    flux_[dirZ][compIdxs_[ii]].resize(bufferSize, 0.0);
                 }
             }
+            const auto& fp = simulator_.vanguard().eclState().fieldProps();
+            const auto& permx = fp.get_double("PERMX");
+            initialPerm_[dirX].assign(permx.begin(), permx.end());
+            const auto& permy = fp.get_double("PERMY");
+            initialPerm_[dirY].assign(permy.begin(), permy.end());
+            const auto& permz = fp.get_double("PERMZ");
+            initialPerm_[dirZ].assign(permz.begin(), permz.end());
+            const auto& porv = fp.porv(false);
+            initialPorv_.assign(porv.begin(), porv.end());
         }
 
-
-        template <class Intersection>
-        void computeFaceProperties(const Intersection& intersection,
-                                const int insideElemIdx,
-                                const int insideFaceIdx,
-                                const int outsideElemIdx,
-                                const int outsideFaceIdx,
-                                DimVector& faceCenterInside,
-                                DimVector& faceCenterOutside,
-                                DimVector& faceAreaNormal) const
-        {
-            int faceIdx = intersection.id();
-
-            if(grid_.maxLevel() == 0) {
-                faceCenterInside = grid_.faceCenterEcl(insideElemIdx, insideFaceIdx, intersection);
-                faceCenterOutside = grid_.faceCenterEcl(outsideElemIdx, outsideFaceIdx, intersection);
-                faceAreaNormal = grid_.faceAreaNormalEcl(faceIdx);
-            }
-            else {
-                if ((intersection.inside().level() != intersection.outside().level())) {
-
-                    // For CpGrid with LGRs, intersection laying on the boundary of an LGR, having two neighboring cells:
-                    // one coarse neighboring cell and one refined neighboring cell, we get the corresponding parent
-                    // intersection (from level 0), and use the center of the parent intersection for the coarse
-                    // neighboring cell.
-
-                    // Get parent intersection and its geometry
-                    const auto& parentIntersection = grid_.getParentIntersectionFromLgrBoundaryFace(intersection);
-                    const auto& parentIntersectionGeometry = parentIntersection.geometry();
-
-                    // For the coarse neighboring cell, take the center of the parent intersection.
-                    // For the refined neighboring cell, take the 'usual' center. 
-                    faceCenterInside =  (intersection.inside().level() == 0) ? parentIntersectionGeometry.center() :
-                        grid_.faceCenterEcl(insideElemIdx, insideFaceIdx, intersection);
-                    faceCenterOutside = (intersection.outside().level() == 0) ?  parentIntersectionGeometry.center() :
-                        grid_.faceCenterEcl(outsideElemIdx, outsideFaceIdx, intersection);
-
-                    // For some computations, it seems to be benefitial to replace the actual area of the refined face, by
-                    // the area of its parent face. 
-                    // faceAreaNormal = parentIntersection.centerUnitOuterNormal();
-                    // faceAreaNormal *= parentIntersectionGeometry.volume();
-
-                    /// Alternatively, the actual area of the refined face can be computed as follows:
-                    faceAreaNormal = intersection.centerUnitOuterNormal();
-                    faceAreaNormal *= intersection.geometry().volume();
-                }
-                else {
-                    assert(intersection.inside().level() == intersection.outside().level());
-                
-                    faceCenterInside = grid_.faceCenterEcl(insideElemIdx, insideFaceIdx, intersection);
-                    faceCenterOutside = grid_.faceCenterEcl(outsideElemIdx, outsideFaceIdx, intersection);
-                
-                    // When the CpGrid has LGRs, we compute the face area normal differently.
-                    if (intersection.inside().level() > 0) {  // remove intersection.inside().level() > 0
-                        faceAreaNormal = intersection.centerUnitOuterNormal();
-                        faceAreaNormal *= intersection.geometry().volume();
-                    }
-                    else {
-                        faceAreaNormal = grid_.faceAreaNormalEcl(faceIdx);
-                    }
-                }
-            }
-        }
-
-        double getArea(int faceIdx, const auto& elem) {
-            faceIdx -= faceIdx & 1;
-            const auto& gridView_ = simulator_.gridView();
-            auto isIt = gridView_.ibegin(elem);
-            const auto& isEndIt = gridView_.iend(elem);
+        double getArea(int faceDir, const auto& elem) {
+            const auto& gridView = simulator_.gridView();
+            auto isIt = gridView.ibegin(elem);
+            const auto& isEndIt = gridView.iend(elem);
+            double totArea = 0;
             for (; isIt != isEndIt; ++ isIt) {
-                if (isIt->indexInInside() == faceIdx) break;
+                if ((isIt->indexInInside() >> 1) == faceDir) {
+                    totArea += isIt->geometry().volume();
+                }
             }
-            return isIt->geometry().volume();
+            return totArea;
         }
 
-        double getPoro(unsigned index) {
+        double getPoro(unsigned idx) {
             const auto& fp = simulator_.vanguard().eclState().fieldProps();
             const auto& poro = fp.get_double("PORO");
-            return poro.at(index);
+            const auto& porv = fp.porv(false);
+            return porv.at(idx) / initialPorv_.at(idx) * poro.at(idx);
+        }
+
+        double getMultiplier(double faceFlux, int tabnum) {
+            const auto& transmis = simulator_.vanguard().eclState().getTableManager().getTransmisTable();
+            const auto& flux = transmis.getFaceFlux(tabnum - 1);
+            const auto& multiplier = transmis.getMultiplier(tabnum - 1);
+
+            unsigned i = 0, size = flux.size();
+            for (; i < size; ++ i) {
+                if (flux[i] <= faceFlux) break;
+            }
+            if (i == size) i -= 2;
+
+            return multiplier[i] + (faceFlux - flux[i]) * (multiplier[i + 1] - multiplier[i]) / (flux[i + 1] - flux[i]);
+        }
+
+        void updatePerm(DoubleBuf& permx, DoubleBuf& permy, DoubleBuf& permz) {
+            const auto& satnum = simulator_.vanguard().eclState().fieldProps().get_int("SATNUM");
+            for (unsigned i = 0; i < global_nc_; ++ i) {
+                // 目前只考虑水相
+                auto fluxtot = (flux_[dirX][waterCompIdx][i] + flux_[dirY][waterCompIdx][i] + flux_[dirZ][waterCompIdx][i]) * 0.5;
+                double multiplier = getMultiplier(fluxtot, satnum[i]);
+                permx[i] = initialPerm_[dirX][i] * multiplier;
+                permy[i] = initialPerm_[dirY][i] * multiplier;
+                permz[i] = initialPerm_[dirZ][i] * multiplier;
+            }
         }
         
     public:
         std::vector<bool> wasSwitched_;
 
         void timeVariation(double dt) {
-            const auto& gridView_ = simulator_.gridView();
-
-            // 面积相关
+            const auto& gridView = simulator_.gridView();
             const auto& elemMapper = simulator_.model().elementMapper();
-            /*
-            for (const auto& elem : elements(gridView_)) {
-                unsigned elemIdx = elemMapper.index(elem);
-                auto isIt = gridView_.ibegin(elem);
-                const auto& isEndIt = gridView_.iend(elem);
-                for (; isIt != isEndIt; ++ isIt) {
-                    // store intersection, this might be costly
-                    const auto& intersection = *isIt;
-
-                    // deal with grid boundaries
-                    if (intersection.boundary()) {
-                        // compute the transmissibilty for the boundary intersection
-                        const auto& geometry = intersection.geometry();
-                        const auto& faceCenterInside = geometry.center();
-
-                        auto faceAreaNormal = intersection.centerUnitOuterNormal();
-                        faceAreaNormal *= geometry.volume();
-                        continue;
-                    }
-
-                    if (!intersection.neighbor()) {
-                        // elements can be on process boundaries, i.e. they are not on the
-                        // domain boundary yet they don't have neighbors.
-                        continue;
-                    }
-
-                    const auto& outsideElem = intersection.outside();
-                    unsigned outsideElemIdx = elemMapper.index(outsideElem);  
-
-                    // Get the Cartesian indices of the origen cells (parent or equivalent cell on level zero), for CpGrid with LGRs.
-                    // For genral grids and no LGRs, get the usual Cartesian Index.
-                    unsigned insideCartElemIdx = this-> lookUpCartesianData_.template getFieldPropCartesianIdx<Grid>(elemIdx);
-                    unsigned outsideCartElemIdx =  this-> lookUpCartesianData_.template getFieldPropCartesianIdx<Grid>(outsideElemIdx);
-
-                    // we only need to calculate a face's transmissibility
-                    // once...
-                    // In a parallel run insideCartElemIdx>outsideCartElemIdx does not imply elemIdx>outsideElemIdx for
-                    // ghost cells and we need to use the cartesian index as this will be used when applying Z multipliers
-                    // To cover the case where both cells are part of an LGR and as a consequence might have
-                    // the same cartesian index, we tie their Cartesian indices and the ones on the leaf grid view.
-                    if (std::tie(insideCartElemIdx, elemIdx) > std::tie(outsideCartElemIdx, outsideElemIdx))
-                        continue;
-
-                    // local indices of the faces of the inside and
-                    // outside elements which contain the intersection
-                    int insideFaceIdx  = intersection.indexInInside();
-                    int outsideFaceIdx = intersection.indexInOutside();
-
-                    if (insideFaceIdx == -1) {
-                        continue;
-                    }
-
-                    DimVector faceCenterInside;
-                    DimVector faceCenterOutside;
-                    DimVector faceAreaNormal;
-
-                    computeFaceProperties(intersection,
-                                        elemIdx,
-                                        insideFaceIdx,
-                                        outsideElemIdx,
-                                        outsideFaceIdx,
-                                        faceCenterInside,
-                                        faceCenterOutside,
-                                        faceAreaNormal);
-
-                }
-            }*/
-            
-
-            // 流量相关 单位 体积/秒
-            // ElementContext elemCtx(simulator_);
             const auto& flowsInfos = simulator_.model().linearizer().getFlowsInfo();
-            if (flowsInfos.empty()) return;
+            assert(!flowsInfos.empty());
 
-            // for (const auto& elem : elements(gridView_, Dune::Partitions::interior)) {
-            for (const auto& elem : elements(gridView_)) {
+            for (const auto& elem : elements(gridView)) {
                 unsigned gridIdx = elemMapper.index(elem);
                 
                 for (auto& flowsInfo : flowsInfos[gridIdx]) {
+                    // 跳过NNC
                     if (flowsInfo.faceId < 0) continue;
-                    
-                    auto gas_flows = flowsInfo.flow[conti0EqIdx + Indices::canonicalToActiveComponentIndex(gasCompIdx)];
-                    auto oil_flows = flowsInfo.flow[conti0EqIdx + Indices::canonicalToActiveComponentIndex(oilCompIdx)];
-                    auto water_flows = flowsInfo.flow[conti0EqIdx + Indices::canonicalToActiveComponentIndex(waterCompIdx)];
-                    if (!flows_[flowsInfo.faceId][gasCompIdx].empty()) {
-                        flows_[flowsInfo.faceId][gasCompIdx][gridIdx]
-                            += abs(gas_flows);
-                    }
-                    if (!flows_[flowsInfo.faceId][oilCompIdx].empty()) {
-                        flows_[flowsInfo.faceId][oilCompIdx][gridIdx]
-                            += abs(oil_flows);
-                    }
-                    if (!flows_[flowsInfo.faceId][waterCompIdx].empty()) {
-                        flows_[flowsInfo.faceId][waterCompIdx][gridIdx]
-                            += abs(water_flows);
+                    for (unsigned ii = 0; ii < phaseIdxs_.size(); ++ii) {
+                        if (!FluidSystem::phaseIsActive(phaseIdxs_[ii])) continue;
+                        auto flows = flowsInfo.flow[conti0EqIdx + Indices::canonicalToActiveComponentIndex(compIdxs_[ii])];
+                        flows_[flowsInfo.faceId >> 1][compIdxs_[ii]][gridIdx] += abs(flows);
                     }
                 }
-                // old code
-                {
-                // elemCtx.updatePrimaryStencil(elem);
-                // elemCtx.updatePrimaryIntensiveQuantities(/*timeIdx=*/0);
-
-                // for (unsigned dofIdx = 0; dofIdx < elemCtx.numPrimaryDof(/*timeIdx=*/0); ++dofIdx) {
-                //     unsigned globalDofIdx = elemCtx.globalSpaceIndex(dofIdx, /*timeIdx=*/0);
-                    
-                //     for (auto& flowsInfo : flowsInfos[globalDofIdx]) {
-                //         if (flowsInfo.faceId < 0) continue;
-                        
-                //         auto gas_flows = flowsInfo.flow[conti0EqIdx + Indices::canonicalToActiveComponentIndex(gasCompIdx)];
-                //         auto oil_flows = flowsInfo.flow[conti0EqIdx + Indices::canonicalToActiveComponentIndex(oilCompIdx)];
-                //         auto water_flows = flowsInfo.flow[conti0EqIdx + Indices::canonicalToActiveComponentIndex(waterCompIdx)];
-                //         if (!flows_[flowsInfo.faceId][gasCompIdx].empty()) {
-                //             flows_[flowsInfo.faceId][gasCompIdx][globalDofIdx]
-                //                 += abs(gas_flows);
-                //         }
-                //         if (!flows_[flowsInfo.faceId][oilCompIdx].empty()) {
-                //             flows_[flowsInfo.faceId][oilCompIdx][globalDofIdx]
-                //                 += abs(oil_flows);
-                //         }
-                //         if (!flows_[flowsInfo.faceId][waterCompIdx].empty()) {
-                //             flows_[flowsInfo.faceId][waterCompIdx][globalDofIdx]
-                //                 += abs(water_flows);
-                //         }
-                //     }
-                // }
-                }
-
                 
                 // 计算网格面通量
-                const std::array<int, 3> phaseIdxs = { gasPhaseIdx, oilPhaseIdx, waterPhaseIdx };
-                const std::array<int, 3> compIdxs = { gasCompIdx, oilCompIdx, waterCompIdx };
-                for (unsigned ii = 0; ii < phaseIdxs.size(); ++ii) {
-                    if (FluidSystem::phaseIsActive(phaseIdxs[ii])) {
-                        // 流量(绝对值) * dt/(面积 * 孔隙度)
-                        Scalar flux = 0;
-                        for (int faceIdx = 0; faceIdx < 6; ++ faceIdx) {
-                            if (flows_[faceIdx][compIdxs[ii]].empty()) continue;
-                            auto curFaceFlux = flows_[faceIdx][compIdxs[ii]][gridIdx] * dt;
-                            
-                            // double faceArea = 0;
-                            // auto isIt = gridView_.ibegin(elem);
-                            // const auto& isEndIt = gridView_.iend(elem);
-                            // assert(isIt != isEndIt);
-                            // for (; isIt != isEndIt; ++ isIt) {
-                            //     if (isIt->indexInInside() == faceIdx) break;
-                            // }
-                            // faceArea = isIt->geometry().volume();
-                            
-                            flux += curFaceFlux / (getArea(faceIdx, elem) * getPoro(gridIdx));
-                        }
-                        centerFaceFluxes_[compIdxs[ii]][gridIdx] += flux / 2;
+                for (unsigned ii = 0; ii < phaseIdxs_.size(); ++ii) {
+                    if (!FluidSystem::phaseIsActive(phaseIdxs_[ii])) continue;
+                    // 流量(绝对值) * dt/(面积 * 孔隙度)
+                    for (int faceDir = 0; faceDir < 3; ++ faceDir) {
+                        flux_[faceDir][compIdxs_[ii]][gridIdx] += 
+                                    flows_[faceDir][compIdxs_[ii]][gridIdx]
+                                    * dt
+                                    / (getArea(faceDir, elem) * getPoro(gridIdx));
                     }
                 }
             }
 
-            // 目前测试无误
             // 计算变化后的渗透率，调用update更新传导率
-            // const auto& fp = simulator_.vanguard().eclState().fieldProps();
-            // auto& permx = const_cast<std::vector<double>&>(fp.get_double("PERMX"));
-            // auto& permy = const_cast<std::vector<double>&>(fp.get_double("PERMY"));
-            // auto& permz = const_cast<std::vector<double>&>(fp.get_double("PERMZ"));
-            // permx[0] = -20;
-            // auto& transmissibilities = simulator_.problem().eclTransmissibilities();
-            // transmissibilities.update(true, {}, true);
+            const auto& fp = simulator_.vanguard().eclState().fieldProps();
+            auto& permx = const_cast<std::vector<double>&>(fp.get_double("PERMX"));
+            auto& permy = const_cast<std::vector<double>&>(fp.get_double("PERMY"));
+            auto& permz = const_cast<std::vector<double>&>(fp.get_double("PERMZ"));
+            updatePerm(permx, permy, permz);
+            auto& transmissibilities = simulator_.problem().eclTransmissibilities();
+            transmissibilities.update(true, {}, true);
         }
     };
 } // namespace Opm
